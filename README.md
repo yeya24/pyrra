@@ -6,57 +6,185 @@
 </p>
 <p align="center"><img src="docs/screenshot-readme.png" width=700 alt="Screenshot of Pyrra"></p>
 
+<p align="center"><a href="https://github.com/pyrra-dev/pyrra/tree/main/examples/grafana">Dashboards</a> to visualize SLOs in Grafana:</p>
+
+<p align="center"><img src="examples/grafana/detail.png" width=700 alt="Pyrra Grafana dashboard"></p>
+
+<p align="center">Watch the 5min lightning talk at Prometheus Day 2022:</p>
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=8Ox0M6HIE3w">
+    <img src="docs/youtube.jpg" width=700 alt="PrometheusDay 2022: Lightning Talk Pyrra">
+  </a>
+</p>
 
 ## Features
 
-- Support for Kubernetes, Docker, and filesystem
+- Support for Kubernetes, Docker, and reading from the filesystem
 - Alerting: Generates 4 Multi Burn Rate Alerts with different severity
 - Page listing all Service Level Objectives
+  - Search through names and labels
+  - Sorted by remaining error budget to see the worst ones quickly
   - All columns sortable
-  - Sorted by remaining error budget to see worst ones quickly
+  - View and hide individual columns
+  - Clicking on labels to filter SLOs that contain the label  
   - Tool-tips when hovering for extra context
 - Page with details for a Service Level Objective
-
   - Objective, Availability, Error Budget highlighted as 3 most important numbers
   - Graph to see how the error budget develops over time
   - Time range picker to change graphs
+  - Switch between absolute and relative chart scales
   - Request, Errors, Duration (RED) graphs for the underlying service
   - Multi Burn Rate Alerts overview table
 - Caching of Prometheus query results
 - Thanos: Disabling of partial responses and downsampling to 5m and 1h
-- OpenAPI generated API
+- connect-go and connect-web generate protobuf APIs
+- Grafana dashboard via `--generic-rules` generation
 
 ## Feedback & Support
 
 If you have any feedback, please open a discussion in the GitHub Discussions of this project.  
 We would love to learn what you think!
 
-## Acknowledgements
-
-[@aditya-konarde](https://github.com/aditya-konarde), [@brancz](https://github.com/brancz), [@cbrgm](https://github.com/cbrgm), [@codesome](https://github.com/codesome), [@ekeih](https://github.com/ekeih), [@guusvw](https://github.com/guusvw), [@jzelinskie](https://github.com/jzelinskie), [@kakkoyun](https://github.com/kakkoyun), [@lilic](https://github.com/lilic), [@markusressel](https://github.com/markusressel), [@morremeyer](https://github.com/morremeyer), [@mxinden](https://github.com/mxinden), [@numbleroot](https://github.com/numbleroot), [@paulfantom](https://github.com/paulfantom), [@RiRa12621](https://github.com/RiRa12621), [@tboerger](https://github.com/tboerger), and Maria Franke.
-
-While we were working on Pyrra in private these amazing people helped us with a look of feedback and some even took an extra hour for a in-depth testing! Thank you all so much!
-
-Additionally, [@metalmatze](https://github.com/metalmatze) would like to thank [Polar Signals](https://www.polarsignals.com/) for allowing us to work on this project in his 20% time.
-
 ## Demo
 
-Check out our live demo on [demo.pyrra.dev](https://demo.pyrra.dev)!
+Check out our live demo on [demo.pyrra.dev](https://demo.pyrra.dev)!  
+Grafana dashboards are available as demo on [demo.pyrra.dev/grafana](https://demo.pyrra.dev/grafana/d/ccssRIenz/pyrra-detail?orgId=1&refresh=10s&from=now-7d&to=now)!
 
 Feel free to give it a try there!
 
-## Installation
+## How It Works
 
-There are pre-build container images available:
+There are three components of Pyrra, all of which work through a single binary:
 
-```bash
-docker pull ghcr.io/pyrra-dev/pyrra:v0.2.0
+- The UI displays SLOs, error budgets, burn rates, etc.
+- The API delivers information about SLOs from a backend (like Kubernetes) to the UI.
+- A backend watches for new SLO objects and then creates Prometheus recording rules for each.
+  - For Kubernetes, there is a Kubernetes Operator available
+  - For everything else, there is a filesystem-based Operator available
+
+For the backend/operator to do its work, an SLO object has to be provided in
+YAML-format:
+
+```yaml
+apiVersion: pyrra.dev/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: pyrra-api-errors
+  namespace: monitoring
+  labels:
+    prometheus: k8s
+    role: alert-rules
+    pyrra.dev/team: operations # Any labels prefixed with 'pyrra.dev/' will be propagated as Prometheus labels, while stripping the prefix.
+spec:
+  target: "99"
+  window: 2w
+  description: Pyrra's API requests and response errors over time grouped by route.
+  indicator:
+    ratio:
+      errors:
+        metric: http_requests_total{job="pyrra",code=~"5.."}
+      total:
+        metric: http_requests_total{job="pyrra"}
+      grouping:
+        - route
 ```
 
-While running Pyrra on its own works there won't be any SLO configured nor will there be any data from a Prometheus to work with.
+Depending on your mode of operation, this information is provided through an
+object in Kubernetes, or read from a static file.
 
-Therefore, you can find a docker-compose example in [examples/docker-compose](examples/docker-compose).  
-This stack comes with Pyrra and Prometheus pre-configured, as well as [some SLOs](examples/docker-compose/pyrra).
+In order to calculate error budget burn rates, Pyrra will then proceed to create
+[Prometheus recording rules](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/#recording-rules)
+for each SLO.
+
+The following rules would be created for the above example:
+
+```
+http_requests:increase2w
+
+http_requests:burnrate3m
+http_requests:burnrate15m
+http_requests:burnrate30m
+http_requests:burnrate1h
+http_requests:burnrate3h
+http_requests:burnrate12h
+http_requests:burnrate2d
+```
+
+The recording rules names are based on the originally provided metric.
+The recording rules contain the necessary labels to uniquely identify the recording rules in case there are multiple ones available.
+
+### Running inside a Kubernetes cluster
+
+> An example for this mode of operation can be found in [examples/kubernetes](examples/kubernetes).
+
+<img src="docs/architecture-kubernetes.png" alt="Kubernetes Architecture" height="300">
+
+Here two deployments are needed: one for the API / UI and one for the
+operator. For the first deployment, start the binary with the `api` argument.
+
+When starting the binary with the `kubernetes` argument, the service will watch
+the apiserver for `ServiceLevelObjectives`. Once a new SLO is picked up,
+Pyrra will create [PrometheusRule](https://prometheus-operator.dev/docs/operator/design/#prometheusrule)
+objects that are automatically picked up by the [Prometheus Operator](https://prometheus-operator.dev).
+
+If you're unable to run the Prometheus Operator inside your cluster, you can add
+the `--config-map-mode=true` flag after the `kubernetes` argument. This will
+save each recording rule in a separate `ConfigMap`.
+
+#### Applying YAML
+
+This repository contains generated YAML files in the [examples/kubernetes/manifests](examples/kubernetes/manifests) folder.
+You can use the following commands to deploy them to a cluster right away.
+
+```bash
+kubectl apply --server-side -f ./example/kubernetes/manifests/setup
+kubectl apply --server-side -f ./example/kubernetes/manifests
+kubectl apply --server-side -f ./example/kubernetes/manifests/slos
+```
+
+##### Applying YAML and validating webhooks via cert-manager
+
+This repository contains more generated YAML files in the [examples/kubernetes/manifests-webhook](examples/kubernetes/manifests-webhook) folder.
+
+This example deployment additionally applies and self-sign Issuer and requests a certificate via cert-manager,
+so that the Kubernetes APIServer can connect to Pyrra to validate any configuration object before applying it to the cluster.
+
+```bash
+kubectl apply --server-side -f ./example/kubernetes/manifests-webhook/setup
+kubectl apply --server-side -f ./example/kubernetes/manifests-webhook
+kubectl apply --server-side -f ./example/kubernetes/manifests-webhook/slos
+```
+
+##### kube-prometheus
+
+The underlying jsonnet code is imported by the [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus) project. 
+If you want to install an entire monitoring stack including Pyrra we highly recommend using kube-prometheus.
+
+#### Install with Helm
+
+Thanks to [@rlex](https://github.com/rlex) there is a [Helm chart](https://artifacthub.io/packages/helm/rlex/pyrra) for deploying Pyrra too. 
+
+### Running inside Docker / Filesystem
+
+> An example for this mode of operation can be found in [examples/docker-compose](examples/docker-compose).
+
+<img src="docs/architecture-filesystem.png" alt="Filesystem Architecture" height="300">
+
+You can easily start Pyrra on its own via the provided Docker image:
+
+```bash
+docker pull ghcr.io/pyrra-dev/pyrra:v0.7.0
+```
+
+When running Pyrra outside of Kubernetes, the SLO object can be provided through
+a YAML file read from the file system. For this, one container or binary needs to
+be started with the `api` argument and the reconciler with the `filesystem`
+argument.
+
+Here, Pyrra will save the generated recording rules to disk where they can be
+picked up by a Prometheus instance. While running Pyrra on its own works, there
+won't be any SLO configured, nor will there be any data from a Prometheus to
+work with. It's designed to work alongside a Prometheus.
 
 ## Tech Stack
 
@@ -64,81 +192,7 @@ This stack comes with Pyrra and Prometheus pre-configured, as well as [some SLOs
 
 **Server:** Go with libraries such as: chi, ristretto, xxhash, client-go.
 
-OpenAPI generated API with server (Go) and clients (Go & TypeScript).
-
-
-## Run Locally
-
-You need to have [Go](https://golang.org/) and [Node](https://nodejs.org/en/download/) installed.
-
-Clone the project
-
-```bash
-git clone https://github.com/pyrra-dev/pyrra.git
-```
-
-Go to the project directory
-
-```bash
-cd pyrra
-```
-
-Install dependencies
-
-```bash
-make install
-```
-
-Build the UI and compile the Go binaries
-
-```bash
-make
-```
-
-### Run the API and UI
-
-Run the API binary in one terminal
-
-```bash
-./bin/api
-```
-
-*Note: the API assumes a Prometheus is running on [localhost:9090](http://localhost:9090) and a backend on [localhost:9444](http://localhost:9444)) by default. Check  `./bin/api --help` flag for the parameters to change those.*
-
-### Run a Kubernetes or filesystem backend
-Run the filesystem binary in another terminal
-
-```bash
-./bin/filesystem
-```
-
-Or run the Kubernetes binary in the other terminal
-
-```bash
-./bin/kubernetes
-```
-
-*Note: This binary tries to run against your default Kubernetes context. Use the `-kubeconfig` flag to change for another kubeconfig*
-
-### Running the UI standalone
-
-Run the Node server to work on the UI itself
-
-```bash
-cd ui
-npm run start
-```
-
-*Note: This still needs the API and one of the backends to really work.*
-
-Most likely you need to update the `window.PUBLIC_API` constant in `ui/public/index.html`.
-
-```diff
--    <script>window.PUBLIC_API = '/'</script>
-+    <script>window.PUBLIC_API = 'http://localhost:9099/'</script>
-```
-
-
+Generated protobuf APIs with connect-go for Go and connect-web for TypeScript. 
 
 ## Roadmap
 
@@ -148,17 +202,42 @@ Best to check the [Projects board](https://github.com/pyrra-dev/pyrra/projects) 
 
 Contributions are always welcome!
 
-See `contributing.md` for ways to get started.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for ways to get started.
 
 Please adhere to this project's `code of conduct`.
 
 ## Maintainers
-| Name           | Area        | GitHub                                             | Twitter                                             |    Company    |
+
+| Name           | Area        | GitHub                                             | Twitter                                             | Company       |
 | :------------- | :---------- | :------------------------------------------------- | :-------------------------------------------------- | :------------ |
 | Nadine Vehling | UX/UI       | [@nadinevehling](https://github.com/nadinevehling) | [@nadinevehling](https://twitter.com/nadinevehling) | Grafana Labs  |
 | Matthias Loibl | Engineering | [@metalmatze](https://github.com/metalmatze)       | [@metalmatze](https://twitter.com/MetalMatze)       | Polar Signals |
 
 We are mostly maintaining Pyrra in our free time.
+
+## Acknowledgements
+
+[@aditya-konarde](https://github.com/aditya-konarde),
+[@brancz](https://github.com/brancz),
+[@cbrgm](https://github.com/cbrgm),
+[@codesome](https://github.com/codesome),
+[@ekeih](https://github.com/ekeih),
+[@guusvw](https://github.com/guusvw),
+[@jzelinskie](https://github.com/jzelinskie),
+[@kakkoyun](https://github.com/kakkoyun),
+[@lilic](https://github.com/lilic),
+[@markusressel](https://github.com/markusressel),
+[@morremeyer](https://github.com/morremeyer),
+[@mxinden](https://github.com/mxinden),
+[@numbleroot](https://github.com/numbleroot),
+[@paulfantom](https://github.com/paulfantom),
+[@RiRa12621](https://github.com/RiRa12621),
+[@tboerger](https://github.com/tboerger),
+and Maria Franke.
+
+While we were working on Pyrra in private these amazing people helped us with a look of feedback and some even took an extra hour for a in-depth testing! Thank you all so much!
+
+Additionally, [@metalmatze](https://github.com/metalmatze) would like to thank [Polar Signals](https://www.polarsignals.com/) for allowing us to work on this project in his 20% time.
 
 ## FAQ
 
@@ -194,5 +273,5 @@ Therefore, we need to pass it as string and internally convert it from string to
 
 Here are some related projects:
 
-* [slok/sloth](https://github.com/slok/sloth)
-* [metalmatze/slo-libsonnet](https://github.com/metalmatze/slo-libsonnet)
+- [slok/sloth](https://github.com/slok/sloth)
+- [metalmatze/slo-libsonnet](https://github.com/metalmatze/slo-libsonnet)

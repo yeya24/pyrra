@@ -23,3 +23,10 @@ bin
 *~
 
 /pyrra
+
+# dist folder
+/dist
+
+# node
+node_modules
+package*.json

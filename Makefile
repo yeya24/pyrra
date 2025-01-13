@@ -1,9 +1,6 @@
 # Image URL to use all building/pushing image targets
 IMG ?= ghcr.io/pyrra-dev/pyrra:main
 
-# Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-CRD_OPTIONS ?= "crd:trivialVersions=true"
-
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -11,10 +8,13 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-OPENAPI ?= docker run --rm \
-		--user=$(shell id -u $(USER)):$(shell id -g $(USER)) \
-		-v ${PWD}:${PWD} \
-		openapitools/openapi-generator-cli:v5.1.1
+gojsontoyaml:
+ifeq (, $(shell which gojsontoyaml))
+	go install github.com/brancz/gojsontoyaml@latest
+GOJSONTOYAML=$(GOBIN)/gojsontoyaml
+else
+GOJSONTOYAML=$(shell which gojsontoyaml)
+endif
 
 all: ui/build build lint
 
@@ -25,7 +25,7 @@ clean:
 	rm -rf ui/build ui/node_modules
 
 # Run tests
-test: generate fmt vet manifests
+test: generate fmt vet
 	go test -race ./... -coverprofile cover.out
 
 build: pyrra
@@ -35,24 +35,11 @@ pyrra: fmt vet
 	CGO_ENABLED=0 go build -v -ldflags '-w -extldflags '-static'' -o pyrra
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
-deploy: manifests config/api.yaml config/kubernetes.yaml
+deploy: manifests
 	kubectl apply -f ./config/api.yaml
 	kubectl apply -f ./config/rbac/role.yaml -n monitoring
 	kubectl apply -f ./config/kubernetes.yaml
 
-# Generate manifests e.g. CRD, RBAC etc.
-manifests: controller-gen
-	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=pyrra-kubernetes webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-
-config: config/api.yaml config/kubernetes.yaml
-
-config/api.yaml: config/api.cue
-	cue fmt -s ./config/
-	cue cmd --inject image=${IMG} "api.yaml" ./config
-
-config/kubernetes.yaml: config/kubernetes.cue
-	cue fmt -s ./config/
-	cue cmd --inject image=${IMG} "kubernetes.yaml" ./config
 
 # Run code linters
 lint: fmt vet
@@ -65,9 +52,12 @@ fmt:
 vet:
 	go vet ./...
 
-# Generate code
-generate: controller-gen manifests
-	$(CONTROLLER_GEN) object:headerFile="kubernetes/hack/boilerplate.go.txt" paths="./..."
+# Generate manifests e.g. CRD, RBAC etc.
+.PHONY: generate
+generate: controller-gen gojsontoyaml ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	$(CONTROLLER_GEN) crd rbac:roleName="pyrra-kubernetes" webhook paths="./..." output:crd:artifacts:config=jsonnet/controller-gen
+	find jsonnet/controller-gen -name '*.yaml' -print0 | xargs -0 -I{} sh -c '$(GOJSONTOYAML) -yamltojson < "$$1" | jq > "$(PWD)/jsonnet/controller-gen/$$(basename -s .yaml $$1).json"' -- {}
+	find jsonnet/controller-gen -type f ! -name '*.json' -delete
 
 docker-build:
 	docker build . -t ${IMG}
@@ -79,42 +69,34 @@ docker-push:
 # download controller-gen if necessary
 controller-gen:
 ifeq (, $(shell which controller-gen))
-	@{ \
-	set -e ;\
-	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
-	cd $$CONTROLLER_GEN_TMP_DIR ;\
-	go mod init tmp ;\
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.6.2 ;\
-	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
-	}
+	go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.14.0
 CONTROLLER_GEN=$(GOBIN)/controller-gen
 else
 CONTROLLER_GEN=$(shell which controller-gen)
 endif
 
-.PHONY: openapi
-openapi: openapi/server openapi/client ui/src/client
-
-openapi/server: api.yaml
-	-rm -f $@
-	$(OPENAPI) generate -i ${PWD}/api.yaml -g go-server -o ${PWD}/openapi/server
-	-rm -rf $@/{Dockerfile,go.mod,main.go,README.md}
-	goimports -w $(shell find ./openapi/server/ -name '*.go')
-	touch $@
-
-openapi/client: api.yaml
-	-rm -f $@
-	$(OPENAPI) generate -i ${PWD}/api.yaml -g go -o ${PWD}/openapi/client
-	-rm -rf $@/{docs,.travis.yml,git_push.sh,go.mod,go.sum,README.md}
-	goimports -w $(shell find ./openapi/client/ -name '*.go')
-	touch $@
-
-ui/src/client: api.yaml
-	-rm -f $@
-	$(OPENAPI) generate -i ${PWD}/api.yaml -g typescript-fetch -o ${PWD}/ui/src/client
+ui: ui/node_modules ui/build
 
 ui/node_modules:
 	cd ui && npm install
 
 ui/build:
 	cd ui && npm run build
+
+examples: examples/kubernetes/manifests examples/kubernetes/manifests-webhook examples/openshift/manifests
+
+examples/kubernetes/manifests: examples/kubernetes/main.jsonnet jsonnet/controller-gen/pyrra.dev_servicelevelobjectives.json jsonnet/pyrra/kubernetes.libsonnet
+	jsonnetfmt -i examples/kubernetes/main.jsonnet
+	jsonnet -m examples/kubernetes/manifests examples/kubernetes/main.jsonnet | xargs -I{} sh -c 'cat {} | gojsontoyaml > {}.yaml' -- {}
+	find examples/kubernetes/manifests -type f ! -name '*.yaml' -delete
+
+examples/kubernetes/manifests-webhook: examples/kubernetes/main-webhook.jsonnet jsonnet/controller-gen/pyrra.dev_servicelevelobjectives.json jsonnet/pyrra/kubernetes.libsonnet
+	jsonnetfmt -i examples/kubernetes/main-webhook.jsonnet
+	jsonnet -m examples/kubernetes/manifests-webhook examples/kubernetes/main-webhook.jsonnet | xargs -I{} sh -c 'cat {} | gojsontoyaml > {}.yaml' -- {}
+	find examples/kubernetes/manifests-webhook -type f ! -name '*.yaml' -delete
+
+examples/openshift/manifests: examples/openshift/main.jsonnet jsonnet/controller-gen/pyrra.dev_servicelevelobjectives.json jsonnet/pyrra/kubernetes.libsonnet
+	jsonnetfmt -i examples/openshift/main.jsonnet
+	jsonnet -m examples/openshift/manifests examples/openshift/main.jsonnet | xargs -I{} sh -c 'cat {} | gojsontoyaml > {}.yaml' -- {}
+	find examples/openshift/manifests -type f ! -name '*.yaml' -delete
+

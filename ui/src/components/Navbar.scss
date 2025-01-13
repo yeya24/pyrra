@@ -13,14 +13,13 @@
 
   .breadcrumb {
     font-size: 18px;
-    margin-left: 16px;
 
     a {
       color: $gray-700;
+      text-decoration: none;
 
       &:hover {
         color: $gray-900;
-        text-decoration: none;
       }
     }
 

@@ -1,9 +1,16 @@
-export const labelsString = (lset: { [key: string]: string; } | undefined): string => {
+export interface Labels {
+  [key: string]: string
+}
+
+export const MetricName = '__name__'
+
+export const labelsString = (lset: Labels | undefined): string => {
   if (lset === undefined) {
     return ''
   }
 
-  let s = '';
+  // TODO: Sort these labels before mapping or are they always sorted?
+  let s = ''
   s += '{'
   s += Object.entries(lset)
     .map((l) => `${l[0]}="${l[1]}"`)
@@ -12,19 +19,18 @@ export const labelsString = (lset: { [key: string]: string; } | undefined): stri
   return s
 }
 
-export const parseLabels = (expr: string | null): { [key: string]: string } => {
-  if (expr == null || expr === '{}') {
+export const labelValues = (lset: Labels): string[] => Object.values(lset)
+
+export const parseLabels = (expr: string | null): Labels => {
+  if (expr == null) {
     return {}
   }
-  expr = expr.replace(/^{+|}+$/gm, '')
-  let lset: { [key: string]: string; } = {}
-  expr.split(',').forEach((s: string) => {
-    let pair = s.split('=')
-    if (pair.length !== 2) {
-      throw new Error('pair does not have key and value')
+  const lset: {[key: string]: string} = {}
+  for (const match of expr.matchAll(/(?<label>[a-zA-Z0-9_]+)="(?<value>[^"]+)/g)) {
+    if (match.groups?.label !== undefined) {
+      lset[match.groups.label] = match.groups.value
     }
-    lset[pair[0].trim()] = pair[1].replace(/^"+|"+$/gm, '').trim()
-  })
+  }
   return lset
 }
 

@@ -1,106 +1,170 @@
-import { Link, useHistory, useLocation } from 'react-router-dom'
-import React, { useEffect, useMemo, useState } from 'react'
-import { Badge, Button, ButtonGroup, Col, Container, Row, Spinner } from 'react-bootstrap'
+import {Link, useLocation, useNavigate} from 'react-router-dom'
+import React, {useCallback, useEffect, useMemo, useState} from 'react'
 import {
-  Configuration,
-  Objective,
-  ObjectivesApi,
-  ObjectiveStatus,
-  ObjectiveStatusAvailability,
-  ObjectiveStatusBudget
-} from '../client'
-import { formatDuration, parseDuration, PATH_PREFIX } from '../App'
+  Badge,
+  Button,
+  ButtonGroup,
+  Col,
+  Container,
+  OverlayTrigger,
+  Row,
+  Spinner,
+  Tooltip as OverlayTooltip,
+} from 'react-bootstrap'
+import {API_BASEPATH, hasObjectiveType, latencyTarget, ObjectiveType} from '../App'
 import Navbar from '../components/Navbar'
-import { parseLabels } from "../labels";
-import ErrorBudgetGraph from "../components/graphs/ErrorBudgetGraph";
-import RequestsGraph from "../components/graphs/RequestsGraph";
-import ErrorsGraph from "../components/graphs/ErrorsGraph";
-import AlertsTable from "../components/AlertsTable";
+import {MetricName, parseLabels} from '../labels'
+import ErrorBudgetGraph from '../components/graphs/ErrorBudgetGraph'
+import RequestsGraph from '../components/graphs/RequestsGraph'
+import ErrorsGraph from '../components/graphs/ErrorsGraph'
+import {createConnectTransport} from '@bufbuild/connect-web'
+import {createPromiseClient} from '@connectrpc/connect'
+import {ObjectiveService} from '../proto/objectives/v1alpha1/objectives_connect'
+import AlertsTable from '../components/AlertsTable'
+import Toggle from '../components/Toggle'
+import DurationGraph from '../components/graphs/DurationGraph'
+import uPlot from 'uplot'
+import {PrometheusService} from '../proto/prometheus/v1/prometheus_connect'
+import {replaceInterval, usePrometheusQuery} from '../prometheus'
+import {useObjectivesList} from '../objectives'
+import {Objective} from '../proto/objectives/v1alpha1/objectives_pb'
+import {formatDuration, parseDuration} from '../duration'
+import ObjectiveTile from '../components/tiles/ObjectiveTile'
+import AvailabilityTile from '../components/tiles/AvailabilityTile'
+import ErrorBudgetTile from '../components/tiles/ErrorBudgetTile'
+import Tiles from '../components/tiles/Tiles'
+import {IconChartArea, IconChartLine} from '../components/Icons'
 
 const Detail = () => {
-  const history = useHistory()
-  const query = new URLSearchParams(useLocation().search)
+  const baseUrl = API_BASEPATH === undefined ? 'http://localhost:9099' : API_BASEPATH
 
-  const api = useMemo(() => {
-    return new ObjectivesApi(new Configuration({ basePath: `./api/v1` }))
-  }, [])
+  const client = useMemo(() => {
+    return createPromiseClient(ObjectiveService, createConnectTransport({baseUrl}))
+  }, [baseUrl])
 
-  const queryExpr = query.get('expr')
-  const expr = queryExpr == null ? '' : queryExpr
-  const labels = parseLabels(expr)
+  const promClient = useMemo(() => {
+    return createPromiseClient(PrometheusService, createConnectTransport({baseUrl}))
+  }, [baseUrl])
 
-  const groupingExpr = query.get('grouping')
-  const grouping = groupingExpr == null ? '' : groupingExpr
-  const groupingLabels = parseLabels(grouping)
+  const navigate = useNavigate()
+  const {search} = useLocation()
 
-  const name: string = labels['__name__']
+  const {from, to, expr, grouping, groupingExpr, groupingLabels, name, labels} = useMemo(() => {
+    const query = new URLSearchParams(search)
 
-  const timeRangeQuery = query.get('timerange')
-  const timeRangeParsed = timeRangeQuery != null ? parseDuration(timeRangeQuery) : null
-  const timeRange: number = timeRangeParsed != null ? timeRangeParsed : 3600 * 1000
+    const queryExpr = query.get('expr')
+    const expr = queryExpr == null ? '' : queryExpr
+    const labels = parseLabels(expr)
 
-  const [objective, setObjective] = useState<Objective | null>(null);
-  const [objectiveError, setObjectiveError] = useState<string>('');
+    const groupingExpr = query.get('grouping')
+    const grouping = groupingExpr == null ? '' : groupingExpr
+    const groupingLabels = parseLabels(grouping)
 
-  enum StatusState {
-    Unknown,
-    Error,
-    NoData,
-    Success,
-  }
+    const name: string = labels[MetricName]
 
-  const [statusState, setStatusState] = useState<StatusState>(StatusState.Unknown);
-  const [availability, setAvailability] = useState<ObjectiveStatusAvailability | null>(null);
-  const [errorBudget, setErrorBudget] = useState<ObjectiveStatusBudget | null>(null);
+    let to: number = Date.now()
+    const toQuery = query.get('to')
+    if (toQuery !== null) {
+      if (!toQuery.includes('now')) {
+        to = parseInt(toQuery)
+      }
+    }
 
-  useEffect(() => {
-    // const controller = new AbortController()
+    let from: number = to - 60 * 60 * 1000
+    const fromQuery = query.get('from')
+    if (fromQuery !== null) {
+      if (fromQuery.includes('now')) {
+        const duration = parseDuration(fromQuery.substring(4)) // omit first 4 chars: `now-`
+        if (duration !== null) {
+          from = to - duration
+        }
+      } else {
+        from = parseInt(fromQuery)
+      }
+    }
+
     document.title = `${name} - Pyrra`
 
-    api.listObjectives({ expr: expr })
-      .then((os: Objective[]) => os.length === 1 ? setObjective(os[0]) : setObjective(null))
-      .catch((resp) => {
-        if (resp.status !== undefined) {
-          resp.text().then((err: string) => (setObjectiveError(err)))
-        } else {
-          setObjectiveError(resp.message)
-        }
-      })
+    return {from, to, expr, grouping, groupingExpr, groupingLabels, name, labels}
+  }, [search])
 
-    api.getObjectiveStatus({ expr: expr, grouping: grouping })
-      .then((s: ObjectiveStatus[]) => {
-        if (s.length === 0) {
-          setStatusState(StatusState.NoData)
-        } else if (s.length === 1) {
-          setAvailability(s[0].availability)
-          setErrorBudget(s[0].budget)
-          setStatusState(StatusState.Success)
-        } else {
-          setStatusState(StatusState.Error)
-        }
-      })
-      .catch((resp) => {
-        if (resp.status === 404) {
-          setStatusState(StatusState.NoData)
-        } else {
-          setStatusState(StatusState.Error)
-        }
-      })
+  const [autoReload, setAutoReload] = useState<boolean>(true)
+  const [absolute, setAbsolute] = useState<boolean>(true)
 
-    // return () => {
-    //     // cancel any pending requests.
-    //     controller.abort()
-    // }
-  }, [api, name, expr, grouping, timeRange, StatusState.Error, StatusState.NoData, StatusState.Success])
+  const {
+    response: objectiveResponse,
+    error: objectiveError,
+    status: objectiveStatus,
+  } = useObjectivesList(client, expr, grouping)
 
-  if (objectiveError !== '') {
+  const objective: Objective | null = objectiveResponse?.objectives[0] ?? null
+
+  const {response: totalResponse, status: totalStatus} = usePrometheusQuery(
+    promClient,
+    objective?.queries?.countTotal ?? '',
+    to / 1000,
+    {enabled: objectiveStatus === 'success' && objective?.queries?.countTotal !== undefined},
+  )
+
+  const {response: errorResponse, status: errorStatus} = usePrometheusQuery(
+    promClient,
+    objective?.queries?.countErrors ?? '',
+    to / 1000,
+    {enabled: objectiveStatus === 'success' && objective?.queries?.countTotal !== undefined},
+  )
+
+  const updateTimeRange = useCallback(
+    (from: number, to: number, absolute: boolean) => {
+      let fromStr = from.toString()
+      let toStr = to.toString()
+      if (!absolute) {
+        fromStr = `now-${formatDuration(to - from)}`
+        toStr = 'now'
+      }
+      navigate(
+        `/objectives?expr=${expr}&grouping=${groupingExpr ?? ''}&from=${fromStr}&to=${toStr}`,
+      )
+    },
+    [navigate, expr, groupingExpr],
+  )
+
+  const updateTimeRangeSelect = (min: number, max: number, absolute: boolean) => {
+    // when selecting time ranges with the mouse we want to disable the auto refresh
+    setAutoReload(false)
+    updateTimeRange(min, max, absolute)
+  }
+
+  const duration = to - from
+  const interval = intervalFromDuration(duration)
+
+  useEffect(() => {
+    if (autoReload) {
+      const id = setInterval(() => {
+        const newTo = Date.now()
+        const newFrom = newTo - duration
+        updateTimeRange(newFrom, newTo, false)
+      }, interval)
+
+      return () => {
+        clearInterval(id)
+      }
+    }
+  }, [updateTimeRange, autoReload, duration, interval])
+
+  const handleTimeRangeClick = (t: number) => () => {
+    const to = Date.now()
+    const from = to - t
+    updateTimeRange(from, to, false)
+  }
+
+  if (objectiveError !== null) {
     return (
       <>
-        <Navbar/>
+        <Navbar />
         <Container>
-          <div style={{ margin: '50px 0' }}>
-            <h3>{objectiveError}</h3>
-            <br/>
+          <div className="header">
+            <h3></h3>
+            <br />
             <Link to="/" className="btn btn-light">
               Go Back
             </Link>
@@ -112,18 +176,16 @@ const Detail = () => {
 
   if (objective == null) {
     return (
-      <div style={{ marginTop: '50px', textAlign: 'center' }}>
+      <div style={{marginTop: '50px', textAlign: 'center'}}>
         <Spinner animation="border" role="status">
-          <span className="sr-only">Loading...</span>
+          <span className="visually-hidden">Loading...</span>
         </Spinner>
       </div>
     )
   }
 
   if (objective.labels === undefined) {
-    return (
-      <></>
-    )
+    return <></>
   }
 
   const timeRanges = [
@@ -131,113 +193,48 @@ const Detail = () => {
     7 * 24 * 3600 * 1000, // 1w
     24 * 3600 * 1000, // 1d
     12 * 3600 * 1000, // 12h
-    3600 * 1000 // 1h
+    3600 * 1000, // 1h
   ]
 
-  const handleTimeRangeClick = (t: number) => () => {
-    history.push(`/objectives?expr=${expr}&grouping=${groupingExpr}&timerange=${formatDuration(t)}`)
-  }
+  const objectiveType = hasObjectiveType(objective)
+  const objectiveTypeLatency =
+    objectiveType === ObjectiveType.Latency || objectiveType === ObjectiveType.LatencyNative
 
-  const renderAvailability = () => {
-    const headline = (<h6>Availability</h6>)
-    switch (statusState) {
-      case StatusState.Unknown:
-        return (
-          <div>
-            {headline}
-            <Spinner animation={'border'} style={{
-              width: 50,
-              height: 50,
-              padding: 0,
-              borderRadius: 50,
-              borderWidth: 2,
-              opacity: 0.25
-            }}/>
-          </div>
-        )
-      case StatusState.Error:
-        return (
-          <div>
-            {headline}
-            <h2 className="error">Error</h2>
-          </div>
-        )
-      case StatusState.NoData:
-        return (
-          <div>
-            {headline}
-            <h2>No data</h2>
-          </div>
-        )
-      case StatusState.Success:
-        if (availability === null) {
-          return <></>
-        }
-        return (
-          <div className={availability.percentage > objective.target ? 'good' : 'bad'}>
-            {headline}
-            <h2>{(100 * availability.percentage).toFixed(3)}%</h2>
-          </div>
-        )
+  const loading: boolean =
+    totalStatus === 'loading' ||
+    totalStatus === 'idle' ||
+    errorStatus === 'loading' ||
+    errorStatus === 'idle'
+
+  const success: boolean = totalStatus === 'success' && errorStatus === 'success'
+
+  let errors: number = 0
+  let total: number = 1
+  if (totalResponse?.options.case === 'vector' && errorResponse?.options.case === 'vector') {
+    if (errorResponse.options.value.samples.length > 0) {
+      errors = errorResponse.options.value.samples[0].value
+    }
+
+    if (totalResponse.options.value.samples.length > 0) {
+      total = totalResponse.options.value.samples[0].value
     }
   }
 
-  const renderErrorBudget = () => {
-    const headline = (<h6>Error Budget</h6>)
-    switch (statusState) {
-      case StatusState.Unknown:
-        return (
-          <div>
-            {headline}
-            <Spinner animation={'border'} style={{
-              width: 50,
-              height: 50,
-              padding: 0,
-              borderRadius: 50,
-              borderWidth: 2,
-              opacity: 0.25
-            }}/>
-          </div>
-        )
-      case StatusState.Error:
-        return (
-          <div>
-            {headline}
-            <h2 className="error">Error</h2>
-          </div>
-        )
-      case StatusState.NoData:
-        return (
-          <div>
-            {headline}
-            <h2>No data</h2>
-          </div>
-        )
-      case StatusState.Success:
-        if (errorBudget === null) {
-          return <></>
-        }
-        return (
-          <div className={errorBudget.remaining > 0 ? 'good' : 'bad'}>
-            {headline}
-            <h2>{(100 * errorBudget.remaining).toFixed(3)}%</h2>
-          </div>
-        )
-    }
-  }
-
-  const labelBadges = Object.entries({ ...objective.labels, ...groupingLabels })
-    .filter((l: [string, string]) => l[0] !== '__name__')
+  const labelBadges = Object.entries({...objective.labels, ...groupingLabels})
+    .filter((l: [string, string]) => l[0] !== MetricName)
     .map((l: [string, string]) => (
-      <Badge key={l[1]} variant={"light"}>{l[0]}={l[1]}</Badge>
+      <Badge key={l[0]} bg="light" text="dark" className="fw-normal">
+        {l[0]}={l[1]}
+      </Badge>
     ))
 
-  const uPlotCursor = {
+  const uPlotCursor: uPlot.Cursor = {
+    y: false,
     lock: true,
     sync: {
-      key: 'detail'
-    }
-  };
+      key: 'detail',
+    },
+  }
 
   return (
     <>
@@ -250,102 +247,203 @@ const Detail = () => {
       <div className="content detail">
         <Container>
           <Row>
-            <Col xs={12}>
+            <Col xs={12} className="col-xxxl-10 offset-xxxl-1 header">
               <h3>{name}</h3>
               {labelBadges}
             </Col>
             {objective.description !== undefined && objective.description !== '' ? (
-                <Col xs={12} md={6}>
-                  <p>{objective.description}</p>
-                </Col>
-              )
-              : (<></>)}
+              <Col
+                xs={12}
+                md={6}
+                style={{marginTop: labelBadges.length > 0 ? 12 : 0}}
+                className="col-xxxl-5 offset-xxxl-1">
+                <p>{objective.description}</p>
+              </Col>
+            ) : (
+              <></>
+            )}
           </Row>
           <Row>
-            <div className="metrics">
-              <div>
-                <h6>Objective in <strong>{formatDuration(objective.window)}</strong></h6>
-                <h2>{(100 * objective.target).toFixed(3)}%</h2>
-              </div>
-
-              {renderAvailability()}
-
-              {renderErrorBudget()}
-
-            </div>
+            <Col className="col-xxxl-10 offset-xxxl-1">
+              <Tiles>
+                <ObjectiveTile objective={objective} />
+                <AvailabilityTile
+                  objective={objective}
+                  loading={loading}
+                  success={success}
+                  errors={errors}
+                  total={total}
+                />
+                <ErrorBudgetTile
+                  objective={objective}
+                  loading={loading}
+                  success={success}
+                  errors={errors}
+                  total={total}
+                />
+              </Tiles>
+            </Col>
           </Row>
           <Row>
             <Col className="text-center timerange">
               <div className="inner">
-                <ButtonGroup aria-label="Time Range">
-                  {timeRanges.map((t: number) => (
+                <div className="time">
+                  <ButtonGroup aria-label="Time Range">
+                    {timeRanges.map((t: number) => (
+                      <Button
+                        key={t}
+                        variant="light"
+                        onClick={handleTimeRangeClick(t)}
+                        active={to - from === t}>
+                        {formatDuration(t)}
+                      </Button>
+                    ))}
+                  </ButtonGroup>
+                  <OverlayTrigger
+                    key="auto-reload"
+                    overlay={
+                      <OverlayTooltip id={`tooltip-auto-reload`}>
+                        Automatically reload
+                      </OverlayTooltip>
+                    }>
+                    <span>
+                      <Toggle
+                        checked={autoReload}
+                        onChange={() => setAutoReload(!autoReload)}
+                        onText={formatDuration(interval)}
+                      />
+                    </span>
+                  </OverlayTrigger>
+                </div>
+                <ButtonGroup aria-label="Charts" className="scale">
+                  <OverlayTrigger
+                    key="auto-reload"
+                    overlay={
+                      <OverlayTooltip id={`tooltip-auto-reload`}>
+                        Absolute scale gives a good impression of the big picture.
+                      </OverlayTooltip>
+                    }>
                     <Button
-                      key={t}
                       variant="light"
-                      onClick={handleTimeRangeClick(t)}
-                      active={timeRange === t}
-                    >{formatDuration(t)}</Button>
-                  ))}
+                      onClick={() => {
+                        setAbsolute(true)
+                      }}
+                      active={absolute}>
+                      <IconChartArea width={16} height={16} fill={absolute ? 'white' : 'black'} />
+                      Absolute
+                    </Button>
+                  </OverlayTrigger>
+                  <OverlayTrigger
+                    key="auto-reload"
+                    overlay={
+                      <OverlayTooltip id={`tooltip-auto-reload`}>
+                        Relative scale gives a good impression of every detail.
+                      </OverlayTooltip>
+                    }>
+                    <Button
+                      variant="light"
+                      onClick={() => {
+                        setAbsolute(false)
+                      }}
+                      active={!absolute}>
+                      <IconChartLine width={16} height={16} fill={!absolute ? 'white' : 'black'} />
+                      Relative
+                    </Button>
+                  </OverlayTrigger>
                 </ButtonGroup>
               </div>
             </Col>
           </Row>
-          <Row style={{ marginBottom: 0 }}>
-            <Col>
-              <ErrorBudgetGraph
-                api={api}
-                labels={labels}
-                grouping={groupingLabels}
-                timeRange={timeRange}
-                uPlotCursor={uPlotCursor}
-              />
-            </Col>
-          </Row>
           <Row>
-            <Col style={{ textAlign: 'right' }}>
-              {availability != null ? (
-                <>
-                  <small>Errors: {Math.floor(availability.errors).toLocaleString()}</small>&nbsp;
-                  <small>Total: {Math.floor(availability.total).toLocaleString()}</small>&nbsp;
-                </>
+            <Col>
+              {objective.queries?.graphErrorBudget !== undefined ? (
+                <ErrorBudgetGraph
+                  client={promClient}
+                  query={objective.queries.graphErrorBudget}
+                  from={from}
+                  to={to}
+                  uPlotCursor={uPlotCursor}
+                  updateTimeRange={updateTimeRangeSelect}
+                  absolute={absolute}
+                />
               ) : (
                 <></>
               )}
             </Col>
           </Row>
           <Row>
-            <Col xs={12} sm={6}>
-              <RequestsGraph
-                api={api}
-                labels={labels}
-                grouping={groupingLabels}
-                timeRange={timeRange}
-                uPlotCursor={uPlotCursor}
-              />
+            <Col
+              xs={12}
+              md={objectiveTypeLatency ? 12 : 6}
+              className={objectiveTypeLatency ? 'col-xxxl-4' : ''}>
+              {objective.queries?.graphRequests !== undefined ? (
+                <RequestsGraph
+                  client={promClient}
+                  query={replaceInterval(objective.queries.graphRequests, from, to)}
+                  from={from}
+                  to={to}
+                  uPlotCursor={uPlotCursor}
+                  type={objectiveType}
+                  updateTimeRange={updateTimeRangeSelect}
+                  absolute={absolute}
+                />
+              ) : (
+                <></>
+              )}
             </Col>
-            <Col xs={12} sm={6}>
-              <ErrorsGraph
-                api={api}
-                labels={labels}
-                grouping={groupingLabels}
-                timeRange={timeRange}
-                uPlotCursor={uPlotCursor}
-              />
+            <Col
+              xs={12}
+              md={objectiveTypeLatency ? 12 : 6}
+              className={objectiveTypeLatency ? 'col-xxxl-4' : ''}>
+              {objective.queries?.graphErrors !== undefined ? (
+                <ErrorsGraph
+                  client={promClient}
+                  type={objectiveType}
+                  query={replaceInterval(objective.queries.graphErrors, from, to)}
+                  from={from}
+                  to={to}
+                  uPlotCursor={uPlotCursor}
+                  updateTimeRange={updateTimeRangeSelect}
+                  absolute={absolute}
+                />
+              ) : (
+                <></>
+              )}
             </Col>
+            {objectiveTypeLatency && (
+              <Col xs={12} className="col-xxxl-4">
+                <DurationGraph
+                  client={client}
+                  labels={labels}
+                  grouping={groupingLabels}
+                  from={from}
+                  to={to}
+                  uPlotCursor={uPlotCursor}
+                  updateTimeRange={updateTimeRangeSelect}
+                  target={objective.target}
+                  latency={latencyTarget(objective)}
+                />
+              </Col>
+            )}
           </Row>
           <Row>
             <Col>
               <h4>Multi Burn Rate Alerts</h4>
               <AlertsTable
+                client={client}
+                promClient={promClient}
                 objective={objective}
                 grouping={groupingLabels}
+                from={from}
+                to={to}
+                uPlotCursor={uPlotCursor}
               />
             </Col>
           </Row>
           <Row>
             <Col>
               <h4>Config</h4>
-              <pre style={{ padding: 20, borderRadius: 4 }}>
+              <pre style={{padding: 20, borderRadius: 4}}>
                 <code>{objective.config}</code>
               </pre>
             </Col>
@@ -353,7 +451,28 @@ const Detail = () => {
         </Container>
       </div>
     </>
-  );
-};
+  )
+}
+
+const intervalFromDuration = (duration: number): number => {
+  // map some preset duration to nicer looking intervals
+  switch (duration) {
+    case 60 * 60 * 1000: // 1h => 10s
+      return 10 * 1000
+    case 12 * 60 * 60 * 1000: // 12h => 30s
+      return 30 * 1000
+    case 24 * 60 * 60 * 1000: // 12h => 30s
+      return 90 * 1000
+  }
+
+  if (duration < 10 * 1000 * 1000) {
+    return 10 * 1000
+  }
+  if (duration < 10 * 60 * 1000 * 1000) {
+    return Math.floor(duration / 1000 / 1000) * 1000 // round to seconds
+  }
+
+  return Math.floor(duration / 60 / 1000 / 1000) * 60 * 1000
+}
 
 export default Detail

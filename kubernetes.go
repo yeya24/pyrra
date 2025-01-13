@@ -21,27 +21,36 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"syscall"
+	"time"
 
+	"github.com/bufbuild/connect-go"
+	"github.com/go-kit/log"
 	"github.com/oklog/run"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
-	pyrrav1alpha1 "github.com/pyrra-dev/pyrra/kubernetes/api/v1alpha1"
-	"github.com/pyrra-dev/pyrra/kubernetes/controllers"
-	"github.com/pyrra-dev/pyrra/openapi"
-	openapiserver "github.com/pyrra-dev/pyrra/openapi/server/go"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	pyrrav1alpha1 "github.com/pyrra-dev/pyrra/kubernetes/api/v1alpha1"
+	"github.com/pyrra-dev/pyrra/kubernetes/controllers"
+	"github.com/pyrra-dev/pyrra/mimir"
+	objectivesv1alpha1 "github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1"
+	"github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1/objectivesv1alpha1connect"
 	// +kubebuilder:scaffold:imports
 )
 
-var (
-	scheme = runtime.NewScheme()
-)
+var scheme = runtime.NewScheme()
 
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
@@ -50,80 +59,128 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
-func cmdKubernetes(metricsAddr string) {
+func cmdKubernetes(
+	logger log.Logger,
+	metricsAddr string,
+	configMapMode, genericRules, disableWebhooks bool,
+	certFile, privateKeyFile string,
+	mimirClient *mimir.Client,
+	mimirWriteAlertingRules bool,
+) int {
 	setupLog := ctrl.Log.WithName("setup")
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
 
+	webhookServer := webhook.NewServer(webhook.Options{Port: 9443})
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		MetricsBindAddress: metricsAddr,
-		Port:               9443,
-		LeaderElection:     false,
-		LeaderElectionID:   "9d76195a.metalmatze.de",
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer:    webhookServer,
+		LeaderElection:   false,
+		LeaderElectionID: "9d76195a.pyrra.dev",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	if err = (&controllers.ServiceLevelObjectiveReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("ServiceLevelObjective"),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	reconciler := &controllers.ServiceLevelObjectiveReconciler{
+		Client:                  mgr.GetClient(),
+		Logger:                  log.With(logger, "controllers", "ServiceLevelObjective"),
+		GenericRules:            genericRules,
+		ConfigMapMode:           configMapMode,
+		MimirClient:             mimirClient,
+		MimirWriteAlertingRules: mimirWriteAlertingRules,
+	}
+	if err = reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ServiceLevelObjective")
 		os.Exit(1)
 	}
+	if !disableWebhooks {
+		if err = reconciler.SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ServiceLevelObjective")
+			os.Exit(1)
+		}
+	}
 	// +kubebuilder:scaffold:builder
 
-	var gr run.Group
+	var (
+		gr          run.Group
+		ctx, cancel = context.WithCancel(context.Background())
+	)
+	gr.Add(run.SignalHandler(ctx, os.Interrupt, syscall.SIGTERM))
+
 	{
-		router := openapiserver.NewRouter(
-			openapiserver.NewObjectivesApiController(&ObjectiveServer{client: mgr.GetClient()}),
-		)
-
-		server := http.Server{Addr: ":9444", Handler: router}
-
 		gr.Add(func() error {
-			return server.ListenAndServe()
-		}, func(err error) {
-			_ = server.Shutdown(context.Background())
+			if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+				return fmt.Errorf("unable to set up health check: %w", err)
+			}
+			if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+				return fmt.Errorf("unable to set up ready check: %w", err)
+			}
+			setupLog.Info("starting manager")
+			return mgr.Start(ctx)
+		}, func(_ error) {
+			cancel()
 		})
 	}
 	{
+		router := http.NewServeMux()
+		router.Handle(objectivesv1alpha1connect.NewObjectiveBackendServiceHandler(&KubernetesObjectiveServer{
+			client: mgr.GetClient(),
+		}))
+
+		server := http.Server{
+			Addr:    ":9444",
+			Handler: h2c.NewHandler(router, &http2.Server{}),
+		}
+
 		gr.Add(func() error {
-			setupLog.Info("starting manager")
-			return mgr.Start(ctrl.SetupSignalHandler())
-		}, func(err error) {
+			if certFile != "" && privateKeyFile != "" {
+				setupLog.Info("serving with TLS", "cert", certFile, "key", privateKeyFile)
+				return server.ListenAndServeTLS(certFile, privateKeyFile)
+			}
+			return server.ListenAndServe()
+		}, func(_ error) {
+			shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
 		})
 	}
 
 	if err := gr.Run(); err != nil {
+		if _, ok := err.(run.SignalError); ok {
+			setupLog.Info("terminated", "reason", err)
+			return 0
+		}
 		setupLog.Error(err, "failed to run groups")
-		return
+		return 2
 	}
+	return 0
 }
 
 type KubernetesClient interface {
 	List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
 }
 
-type ObjectiveServer struct {
+type KubernetesObjectiveServer struct {
 	client KubernetesClient
 }
 
-func (o *ObjectiveServer) ListObjectives(ctx context.Context, expr string) (openapiserver.ImplResponse, error) {
+func (s *KubernetesObjectiveServer) List(ctx context.Context, req *connect.Request[objectivesv1alpha1.ListRequest]) (*connect.Response[objectivesv1alpha1.ListResponse], error) {
 	var (
 		matchers         []*labels.Matcher
 		nameMatcher      *labels.Matcher
 		namespaceMatcher *labels.Matcher
 	)
 
-	if expr != "" {
+	if req.Msg.Expr != "" {
 		var err error
-		matchers, err = parser.ParseMetricSelector(expr)
+		matchers, err = parser.ParseMetricSelector(req.Msg.Expr)
 		if err != nil {
-			return openapiserver.ImplResponse{Code: http.StatusBadRequest}, err
+			return nil, connect.NewError(connect.CodeFailedPrecondition, fmt.Errorf("failed to parse expr: %w", err))
 		}
 		for _, m := range matchers {
 			if m.Name == labels.MetricName {
@@ -144,11 +201,11 @@ func (o *ObjectiveServer) ListObjectives(ctx context.Context, expr string) (open
 	}
 
 	var list pyrrav1alpha1.ServiceLevelObjectiveList
-	if err := o.client.List(ctx, &list, &listOpts); err != nil {
-		return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
+	if err := s.client.List(ctx, &list, &listOpts); err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
 	}
 
-	objectives := make([]openapiserver.Objective, 0, len(list.Items))
+	objectives := make([]*objectivesv1alpha1.Objective, 0, len(list.Items))
 	for _, s := range list.Items {
 		if nameMatcher != nil {
 			if !nameMatcher.Matches(s.GetName()) {
@@ -163,33 +220,12 @@ func (o *ObjectiveServer) ListObjectives(ctx context.Context, expr string) (open
 
 		internal, err := s.Internal()
 		if err != nil {
-			return openapiserver.ImplResponse{Code: http.StatusInternalServerError}, err
+			return nil, connect.NewError(connect.CodeInternal, err)
 		}
-		objectives = append(objectives, openapi.ServerFromInternal(internal))
+		objectives = append(objectives, objectivesv1alpha1.FromInternal(internal))
 	}
 
-	return openapiserver.ImplResponse{
-		Code: http.StatusOK,
-		Body: objectives,
-	}, nil
-}
-
-func (o *ObjectiveServer) GetMultiBurnrateAlerts(ctx context.Context, expr string, grouping string) (openapiserver.ImplResponse, error) {
-	return openapiserver.ImplResponse{}, fmt.Errorf("endpoint not implement")
-}
-
-func (o *ObjectiveServer) GetObjectiveErrorBudget(ctx context.Context, expr string, grouping string, i int32, i2 int32) (openapiserver.ImplResponse, error) {
-	return openapiserver.ImplResponse{}, fmt.Errorf("endpoint not implement")
-}
-
-func (o *ObjectiveServer) GetObjectiveStatus(ctx context.Context, expr string, grouping string) (openapiserver.ImplResponse, error) {
-	return openapiserver.ImplResponse{}, fmt.Errorf("endpoint not implement")
-}
-
-func (o *ObjectiveServer) GetREDErrors(ctx context.Context, expr string, grouping string, i int32, i2 int32) (openapiserver.ImplResponse, error) {
-	return openapiserver.ImplResponse{}, fmt.Errorf("endpoint not implement")
-}
-
-func (o *ObjectiveServer) GetREDRequests(ctx context.Context, expr string, grouping string, i int32, i2 int32) (openapiserver.ImplResponse, error) {
-	return openapiserver.ImplResponse{}, fmt.Errorf("endpoint not implement")
+	return connect.NewResponse(&objectivesv1alpha1.ListResponse{
+		Objectives: objectives,
+	}), nil
 }

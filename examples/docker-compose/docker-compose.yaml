@@ -8,7 +8,8 @@ volumes:
 
 services:
   prometheus:
-    image: prom/prometheus:v2.29.2
+    image: prom/prometheus:v2.47.0
+    container_name: prometheus
     restart: always
     networks:
       - pyrra
@@ -18,12 +19,14 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=33d
+      - --web.enable-lifecycle
     volumes:
       - ./prometheus/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
       - prometheus_pyrra:/etc/prometheus/pyrra
 
   pyrra-api:
-    image: ghcr.io/pyrra-dev/pyrra:v0.2.0
+    image: ghcr.io/pyrra-dev/pyrra:v0.7.5
+    container_name: pyrra_api
     restart: always
     command:
       - api
@@ -36,10 +39,13 @@ services:
       - pyrra
 
   pyrra-filesystem:
-    image: ghcr.io/pyrra-dev/pyrra:v0.2.0
+    image: ghcr.io/pyrra-dev/pyrra:v0.7.5
+    user: root
+    container_name: pyrra_filesystem
     restart: always
     command:
       - filesystem
+      - --prometheus-url=http://prometheus:9090
     networks:
       - pyrra
     volumes:

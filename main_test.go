@@ -3,9 +3,15 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	objectivesv1alpha1 "github.com/pyrra-dev/pyrra/proto/objectives/v1alpha1"
+	"github.com/pyrra-dev/pyrra/slo"
 )
 
 func TestMatrixToValues(t *testing.T) {
@@ -180,4 +186,241 @@ func BenchmarkMatrixToValues(b *testing.B) {
 		b.ResetTimer()
 		matrixToValues(m)
 	})
+}
+
+func TestAlertsMatchingObjectives(t *testing.T) {
+	testcases := []struct {
+		name       string
+		metrics    []*model.Sample
+		objectives []slo.Objective
+		inactive   bool
+		alerts     []*objectivesv1alpha1.Alert
+	}{{
+		name: "firing",
+		metrics: []*model.Sample{{
+			Metric: model.Metric{
+				labels.MetricName: "ALERTS",
+				"alertname":       "ErrorBudgetBurn",
+				"alertstate":      "firing",
+				"job":             "prometheus",
+				"long":            "2d",
+				"severity":        "warning",
+				"short":           "3h",
+				"slo":             "prometheus-rule-evaluation-failures",
+			},
+		}},
+		objectives: []slo.Objective{{
+			Labels: labels.Labels{
+				{Name: labels.MetricName, Value: "prometheus-rule-evaluation-failures"},
+				{Name: "namespace", Value: "monitoring"},
+			},
+			Window: model.Duration(14 * 24 * time.Hour),
+		}},
+		alerts: []*objectivesv1alpha1.Alert{{
+			// In the UI we identify the SLO by these labels.
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+				"job":             "prometheus",
+			},
+			Severity: "warning",
+			State:    objectivesv1alpha1.Alert_firing,
+			For:      durationpb.New(90 * time.Minute),
+			Factor:   1,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Hour),
+				Current: -1,
+				Query:   "",
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(48 * time.Hour),
+				Current: -1,
+				Query:   "",
+			},
+		}},
+	}, {
+		name:    "inactive",
+		metrics: []*model.Sample{},
+		objectives: []slo.Objective{{
+			Labels: labels.Labels{
+				{Name: labels.MetricName, Value: "prometheus-rule-evaluation-failures"},
+				{Name: "namespace", Value: "monitoring"},
+			},
+			Window: model.Duration(14 * 24 * time.Hour),
+		}},
+		inactive: true,
+		alerts: []*objectivesv1alpha1.Alert{{
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+				//"alertname":       "ErrorBudgetBurn",
+				//"job":             "prometheus",
+			},
+			Severity: "critical",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(time.Minute),
+			Factor:   14,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Minute),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(30 * time.Minute),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+				//"alertname":       "ErrorBudgetBurn",
+				//"job":             "prometheus",
+			},
+			Severity: "critical",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(8 * time.Minute),
+			Factor:   7,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(15 * time.Minute),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Hour),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+				//"alertname":       "ErrorBudgetBurn",
+				//"job":             "prometheus",
+			},
+			Severity: "warning",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(30 * time.Minute),
+			Factor:   2,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(time.Hour),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(12 * time.Hour),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+				//"alertname":       "ErrorBudgetBurn",
+				//"job":             "prometheus",
+			},
+			Severity: "warning",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(90 * time.Minute),
+			Factor:   1,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Hour),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(48 * time.Hour),
+				Current: -1,
+			},
+		}},
+	}, {
+		name: "mixed",
+		metrics: []*model.Sample{{
+			Metric: model.Metric{
+				labels.MetricName: "ALERTS",
+				"alertname":       "ErrorBudgetBurn",
+				"alertstate":      "firing",
+				"job":             "prometheus",
+				"long":            "2d",
+				"severity":        "warning",
+				"short":           "3h",
+				"slo":             "prometheus-rule-evaluation-failures",
+			},
+		}},
+		objectives: []slo.Objective{{
+			Labels: labels.Labels{
+				{Name: labels.MetricName, Value: "prometheus-rule-evaluation-failures"},
+				{Name: "namespace", Value: "monitoring"},
+			},
+			Window: model.Duration(14 * 24 * time.Hour),
+		}},
+		inactive: true,
+		alerts: []*objectivesv1alpha1.Alert{{
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+			},
+			Severity: "critical",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(time.Minute),
+			Factor:   14,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Minute),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(30 * time.Minute),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+			},
+			Severity: "critical",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(8 * time.Minute),
+			Factor:   7,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(15 * time.Minute),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Hour),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+			},
+			Severity: "warning",
+			State:    objectivesv1alpha1.Alert_inactive,
+			For:      durationpb.New(30 * time.Minute),
+			Factor:   2,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(time.Hour),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(12 * time.Hour),
+				Current: -1,
+			},
+		}, {
+			Labels: map[string]string{
+				labels.MetricName: "prometheus-rule-evaluation-failures",
+				"namespace":       "monitoring",
+			},
+			Severity: "warning",
+			State:    objectivesv1alpha1.Alert_firing,
+			For:      durationpb.New(90 * time.Minute),
+			Factor:   1,
+			Short: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(3 * time.Hour),
+				Current: -1,
+			},
+			Long: &objectivesv1alpha1.Burnrate{
+				Window:  durationpb.New(48 * time.Hour),
+				Current: -1,
+			},
+		}},
+	}}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.alerts, alertsMatchingObjectives(tc.metrics, tc.objectives, nil, tc.inactive))
+		})
+	}
 }
